@@ -8,6 +8,7 @@ and saves them to a mirrored directory structure.
 import os
 import time
 import argparse
+import logging
 from pathlib import Path
 from tqdm import tqdm
 import cv2
@@ -18,7 +19,10 @@ from config.defaults import (
     DEFAULT_FRAME_INTERVAL,
     DEFAULT_QUALITY,
     DEFAULT_FORMAT,
+    DEFAULT_LANGUAGE_FILTER,
+    AVAILABLE_LANGUAGES,
 )
+from lib.video_filename_parser import parse_video_filename
 
 
 def extract_frames_from_video(
@@ -89,6 +93,8 @@ def extract_frames_from_video(
                 cv2.imwrite(output_file, frame, encoding_params)
                 count += 1
                 pbar.update(1)
+                if count % 100 == 0:
+                    logger.debug(f"Extracted {count} frames so far...")
 
             frame_number += 1
 
@@ -108,6 +114,7 @@ def process_directory(
     frame_interval=DEFAULT_FRAME_INTERVAL,
     quality=DEFAULT_QUALITY,
     format=DEFAULT_FORMAT,
+    language_filter=DEFAULT_LANGUAGE_FILTER,
 ):
     """
     Process all videos in a directory structure, maintaining the same structure in output.
@@ -118,6 +125,7 @@ def process_directory(
         frame_interval (int): Extract one frame every N frames
         quality (int): Image quality (0-100)
         format (str): Output image format
+        language_filter (str): Filter videos by language code (e.g., 'EN', 'HI')
 
     Returns:
         tuple: (total_videos, successful_videos, total_frames)
@@ -126,6 +134,7 @@ def process_directory(
     total_videos = 0
     successful_videos = 0
     total_frames = 0
+    filtered_videos = 0
 
     input_root_path = Path(input_root)
     output_root_path = Path(output_root)
@@ -134,6 +143,8 @@ def process_directory(
     logger.info(
         f"Using frame interval: {frame_interval}, quality: {quality}, format: {format}"
     )
+    if language_filter:
+        logger.info(f"Filtering videos by language: {language_filter}")
 
     for root, _, files in os.walk(input_root):
         video_files = [
@@ -147,14 +158,30 @@ def process_directory(
             total_videos += 1
             video_path = os.path.join(root, video_file)
 
+            # Filter by language if specified
+            if language_filter:
+                try:
+                    video_metadata = parse_video_filename(video_file)
+                    video_language = video_metadata.get("language")
+
+                    if video_language != language_filter:
+                        logger.debug(
+                            f"Skipping {video_file} as it is {video_language} (filtered for {language_filter})"
+                        )
+                        filtered_videos += 1
+                        continue
+                except Exception as e:
+                    logger.warning(
+                        f"Could not parse filename {video_file} for language filtering: {e}"
+                    )
+                    # If we can't determine the language, we'll process it anyway
+                    pass
+
             rel_path = Path(root).relative_to(input_root_path)
             video_name = Path(video_file).stem
             output_dir = output_root_path / rel_path / video_name
 
             try:
-                logger.info(f"Processing video {total_videos}: {video_path}")
-                video_start_time = time.time()
-
                 frames_extracted = extract_frames_from_video(
                     video_path,
                     str(output_dir),
@@ -163,31 +190,27 @@ def process_directory(
                     format=format,
                 )
 
-                video_processing_time = time.time() - video_start_time
-
                 if frames_extracted > 0:
                     successful_videos += 1
                     total_frames += frames_extracted
-                    logger.info(
-                        f"Completed video in {video_processing_time:.2f}s: {frames_extracted} frames extracted"
-                    )
-                else:
-                    logger.warning(f"No frames extracted from {video_path}")
 
             except Exception as e:
-                logger.error(f"Error processing video {video_path}: {e}", exc_info=True)
+                logger.error(f"Failed to process video {video_path}: {str(e)}")
 
     processing_time = time.time() - start_time
-    avg_time = processing_time / total_videos if total_videos > 0 else 0
+    processed_videos = total_videos - filtered_videos
+    avg_time = processing_time / processed_videos if processed_videos > 0 else 0
     avg_frames = total_frames / successful_videos if successful_videos > 0 else 0
     extraction_rate = total_frames / processing_time if processing_time > 0 else 0
 
     summary = (
         "\nProcessing Summary:\n"
         "------------------\n"
-        f"Total videos processed: {total_videos}\n"
+        f"Total videos found: {total_videos}\n"
+        f"Filtered by language: {filtered_videos}\n"
+        f"Videos processed: {processed_videos}\n"
         f"Successfully processed: {successful_videos}\n"
-        f"Failed: {total_videos - successful_videos}\n"
+        f"Failed: {processed_videos - successful_videos}\n"
         f"Total frames extracted: {total_frames}\n"
         f"Average frames per video: {avg_frames:.1f}\n"
         f"Total processing time: {processing_time:.2f} seconds\n"
@@ -195,7 +218,6 @@ def process_directory(
         f"Overall extraction rate: {extraction_rate:.2f} frames/second"
     )
 
-    print(summary)
     logger.info(summary)
 
     return total_videos, successful_videos, total_frames
@@ -237,13 +259,39 @@ def main():
         default=DEFAULT_FORMAT,
         help=f"Output image format (default: {DEFAULT_FORMAT})",
     )
+    parser.add_argument(
+        "--language",
+        "-l",
+        choices=AVAILABLE_LANGUAGES,
+        default=DEFAULT_LANGUAGE_FILTER,
+        help=f"Filter videos by language (e.g., 'EN' for English, 'HI' for Hindi)",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output (INFO level)",
+    )
+    parser.add_argument(
+        "--debug", "-d", action="store_true", help="Enable debug output (DEBUG level)"
+    )
 
     args = parser.parse_args()
+
+    # Configure console logging level based on command line arguments
+    if args.debug:
+        from config.logger_config import console_handler
+
+        console_handler.setLevel(logging.DEBUG)
+    elif args.verbose:
+        from config.logger_config import console_handler
+
+        console_handler.setLevel(logging.INFO)
 
     start_time = time.time()
     logger.info(
         f"Starting video frame extraction with parameters: interval={args.interval}, "
-        f"quality={args.quality}, format={args.format}"
+        f"quality={args.quality}, format={args.format}, language_filter={args.language}"
     )
 
     process_directory(
@@ -252,6 +300,7 @@ def main():
         frame_interval=args.interval,
         quality=args.quality,
         format=args.format,
+        language_filter=args.language,
     )
 
     execution_time = time.time() - start_time
